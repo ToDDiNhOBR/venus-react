@@ -1,0 +1,2257 @@
+require('dotenv').config();
+const path = require('path');
+const fs = require('fs');
+const express = require('express');
+const cors = require('cors');
+const { google } = require('googleapis');  // Added import for googleapis
+
+const {
+  SPREADSHEET_ID,
+  CLIENTS_SPREADSHEET_ID,
+  PROFILE_SPREADSHEET_ID,
+  CLIENTS_SHEET,
+  PROSPECTS_SHEET,
+  INDICADOR_SPREADSHEET_ID,
+  INDICADOR_SHEET,
+  USUARIOS_SPREADSHEET_ID,
+  USUARIOS_SHEET,
+  NOTIFICATIONS_SPREADSHEET_ID,
+  NOTIFICATIONS_SHEET,
+} = require('./sheets');
+
+const app = express();
+
+const PORT = process.env.PORT || 5002;
+
+// Serve user profile images statically
+app.use('/user-perfil-images', express.static(path.join(__dirname, '../src/user-perfil-images')));
+
+app.use(cors({
+  origin: ['http://localhost:3000', 'http://localhost:3001', 'http://localhost:3002', 'http://192.168.1.45:3000']
+}));
+
+app.use(express.json({ limit: '10mb' }));
+
+async function startServer() {
+  try {
+    sheets = await initializeSheets();
+
+    const { router: filiaisRouter, setSheets: setFiliaisSheets } = require('./filiais-api');
+    setFiliaisSheets(sheets);
+    app.use('/api/admin/filiais', filiaisRouter);
+
+    const indicadorProspectsRouter = require('./api-indicador-prospects');
+    app.use('/api/indicador', indicadorProspectsRouter);
+
+    const userImageUploadRouter = require('./userImageUpload');
+    app.use('/api/user-image', userImageUploadRouter);
+
+    const productsRouter = require('./products');
+
+    // Logging middleware for /api/products to debug 404 issue
+    app.use('/api/products', (req, res, next) => {
+      console.log(`Received request for /api/products: ${req.method} ${req.originalUrl}`);
+      next();
+    });
+
+    app.use('/api/products', productsRouter);
+
+    const server = app.listen(PORT, () => {
+      console.log(`Server is running on port ${PORT}`);
+    });
+
+    server.on('error', (error) => {
+      if (error.code === 'EADDRINUSE') {
+        console.error(`Port ${PORT} is already in use. Please stop the process using this port or change the port.`);
+      } else {
+        console.error('Server error:', error);
+      }
+    });
+  } catch (error) {
+    console.error('Failed to initialize Google Sheets API. Server not started.');
+  }
+}
+
+startServer();
+
+// GET endpoint to fetch notifications
+app.get('/api/notifications', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    // Fetch global notifications from NOTIFICATIONS_SHEET
+    const globalResponse = await sheets.spreadsheets.values.get({
+      spreadsheetId: NOTIFICATIONS_SPREADSHEET_ID,
+      range: `${NOTIFICATIONS_SHEET}!A2:D`,
+    });
+
+    const globalRows = globalResponse.data.values || [];
+
+    // Map global notifications
+    const globalNotifications = globalRows.map(row => ({
+      id: row[0] || '',
+      title: row[1] || '',
+      message: row[2] || '',
+      date: row[3] || '',
+      sender: 'Todos',
+      isGlobal: true,
+    }));
+
+    // Fetch all usuarios from the usuarios sheet including column B (name) and AC (notifications)
+    const userResponse = await sheets.spreadsheets.values.get({
+      spreadsheetId: USUARIOS_SPREADSHEET_ID,
+      range: `${USUARIOS_SHEET}!B2:AC`,
+    });
+
+    const userRows = userResponse.data.values || [];
+
+    // Aggregate personal notifications from all users with sender name from column B
+    let personalNotifications = [];
+    for (const row of userRows) {
+      const senderName = row[0]; // Column B is index 0 in this range
+      const notificationsJson = row[27]; // Column AC is index 27 in this range
+      if (notificationsJson) {
+        try {
+          const userNotifications = JSON.parse(notificationsJson);
+          if (Array.isArray(userNotifications)) {
+            // Add sender name to each notification without overwriting id
+            const notificationsWithSender = userNotifications.map((notif) => ({
+              ...notif,
+              sender: senderName || 'Unknown',
+              isGlobal: false,
+            }));
+            personalNotifications = personalNotifications.concat(notificationsWithSender);
+          }
+        } catch (e) {
+          console.warn('Failed to parse notifications JSON:', e);
+        }
+      }
+    }
+
+    // Combine global and personal notifications
+    const notifications = [...globalNotifications, ...personalNotifications];
+
+    res.json(notifications);
+  } catch (error) {
+    console.error('Error fetching notifications:', error);
+    res.status(500).json({
+      message: 'Erro ao buscar notificações',
+      error: error.message,
+    });
+  }
+});
+
+// POST endpoint to add a notification
+app.post('/api/notifications', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const { title, message, recipient } = req.body;
+
+    if (!title || !message || !recipient) {
+      return res.status(400).json({ message: 'Título, mensagem e destinatário são obrigatórios' });
+    }
+
+    // Helper function to generate a unique ID for notifications
+    const generateUniqueId = () => {
+      return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    };
+
+    // Assign a unique id to the new notification
+    const newNotification = { id: generateUniqueId(), title, message, date: new Date().toISOString() };
+
+    if (recipient === 'Todos') {
+      // Add notification to global NOTIFICATIONS_SHEET
+      // Fetch existing global notifications
+      const globalResponse = await sheets.spreadsheets.values.get({
+        spreadsheetId: NOTIFICATIONS_SPREADSHEET_ID,
+        range: `${NOTIFICATIONS_SHEET}!A2:D`,
+      });
+
+      const globalRows = globalResponse.data.values || [];
+
+      // Append new notification row
+      const newRow = [newNotification.id, newNotification.title, newNotification.message, newNotification.date];
+
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: NOTIFICATIONS_SPREADSHEET_ID,
+        range: `${NOTIFICATIONS_SHEET}!A:D`,
+        valueInputOption: 'USER_ENTERED',
+        resource: {
+          values: [newRow],
+        },
+      });
+
+      res.json({ success: true, message: 'Notificação global adicionada com sucesso' });
+    } else {
+      // Update specific user notifications JSON
+      // Fetch all usuarios to update notifications column (AC)
+      const response = await sheets.spreadsheets.values.get({
+        spreadsheetId: USUARIOS_SPREADSHEET_ID,
+        range: `${USUARIOS_SHEET}!A2:AC`,
+      });
+
+      const rows = response.data.values || [];
+
+      // Helper to add notification to existing notifications JSON string
+      const addNotificationToJson = (existingJson, newNotif) => {
+        let notifications = [];
+        try {
+          notifications = existingJson ? JSON.parse(existingJson) : [];
+        } catch {
+          notifications = [];
+        }
+        notifications.push(newNotif);
+        return JSON.stringify(notifications);
+      };
+
+      const userIndex = rows.findIndex(row => row[0] === recipient);
+      if (userIndex === -1) {
+        return res.status(404).json({ message: 'Usuário destinatário não encontrado' });
+      }
+      const currentNotif = rows[userIndex][28] || '[]';
+      rows[userIndex][28] = addNotificationToJson(currentNotif, newNotification);
+
+      // Clear existing notifications column data (except header)
+      await sheets.spreadsheets.values.clear({
+        spreadsheetId: USUARIOS_SPREADSHEET_ID,
+        range: `${USUARIOS_SHEET}!AC2:AC`,
+      });
+
+      // Append updated notifications column data
+      const notificationsColumn = rows.map(row => [row[28] || '[]']);
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: USUARIOS_SPREADSHEET_ID,
+        range: `${USUARIOS_SHEET}!AC2:AC`,
+        valueInputOption: 'USER_ENTERED',
+        resource: {
+          values: notificationsColumn,
+        },
+      });
+
+      res.json({ success: true, message: 'Notificação adicionada com sucesso' });
+    }
+  } catch (error) {
+    console.error('Error adding notification:', error);
+    res.status(500).json({
+      message: 'Erro ao adicionar notificação',
+      error: error.message,
+    });
+  }
+});
+
+// DELETE endpoint to delete a notification by id
+app.delete('/api/notifications/:id', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const notificationId = req.params.id.trim();
+
+    // Try to delete from global notifications first
+    const globalResponse = await sheets.spreadsheets.values.get({
+      spreadsheetId: NOTIFICATIONS_SPREADSHEET_ID,
+      range: `${NOTIFICATIONS_SHEET}!A2:D`,
+    });
+
+    const globalRows = globalResponse.data.values || [];
+    const globalIndex = globalRows.findIndex(row => (row[0] || '').trim() === notificationId);
+
+    if (globalIndex !== -1) {
+      // Remove the notification row from global notifications
+      globalRows.splice(globalIndex, 1);
+
+      // Clear the existing data range (except header)
+      await sheets.spreadsheets.values.clear({
+        spreadsheetId: NOTIFICATIONS_SPREADSHEET_ID,
+        range: `${NOTIFICATIONS_SHEET}!A2:D`,
+      });
+
+      // Append the updated rows back to the sheet
+      if (globalRows.length > 0) {
+        await sheets.spreadsheets.values.append({
+          spreadsheetId: NOTIFICATIONS_SPREADSHEET_ID,
+          range: `${NOTIFICATIONS_SHEET}!A2:D`,
+          valueInputOption: 'USER_ENTERED',
+          resource: {
+            values: globalRows,
+          },
+        });
+      }
+
+      return res.json({ success: true, message: 'Notificação global apagada com sucesso' });
+    }
+
+    // If not found in global, try to delete from personal notifications
+    const userResponse = await sheets.spreadsheets.values.get({
+      spreadsheetId: USUARIOS_SPREADSHEET_ID,
+      range: `${USUARIOS_SHEET}!A2:AC`,
+    });
+
+    const userRows = userResponse.data.values || [];
+
+    let notificationFound = false;
+
+    // Iterate over each user row to find and remove the notification
+    for (let i = 0; i < userRows.length; i++) {
+      const notificationsJson = userRows[i][28] || '[]'; // Column AC is index 28
+      let notifications = [];
+      try {
+        notifications = JSON.parse(notificationsJson);
+      } catch (e) {
+        notifications = [];
+      }
+
+      const originalLength = notifications.length;
+      // Filter out the notification with matching id (trimmed)
+      notifications = notifications.filter(notif => (notif.id || '').trim() !== notificationId);
+
+      if (notifications.length !== originalLength) {
+        // Notification found and removed
+        notificationFound = true;
+        // Update the notifications JSON string in the row
+        userRows[i][28] = JSON.stringify(notifications);
+        // Update the sheet for this user's notifications column
+        const rowNumber = i + 2; // offset for header and 1-based index
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: USUARIOS_SPREADSHEET_ID,
+          range: `${USUARIOS_SHEET}!AC${rowNumber}:AC${rowNumber}`,
+          valueInputOption: 'USER_ENTERED',
+          resource: {
+            values: [[userRows[i][28]]],
+          },
+        });
+        break; // Exit loop after deleting notification
+      }
+    }
+
+    if (!notificationFound) {
+      return res.status(404).json({ message: 'Notificação não encontrada' });
+    }
+
+    res.json({ success: true, message: 'Notificação apagada com sucesso' });
+  } catch (error) {
+    console.error('Error deleting notification:', error);
+    res.status(500).json({
+      message: 'Erro ao apagar notificação',
+      error: error.message,
+    });
+  }
+});
+
+// PUT endpoint to update a notification by id
+app.put('/api/notifications/:id', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const notificationId = req.params.id;
+    const { title, message } = req.body;
+
+    if (!title || !message) {
+      return res.status(400).json({ message: 'Título e mensagem são obrigatórios' });
+    }
+
+    // Try to update in global notifications first
+    const globalResponse = await sheets.spreadsheets.values.get({
+      spreadsheetId: NOTIFICATIONS_SPREADSHEET_ID,
+      range: `${NOTIFICATIONS_SHEET}!A2:D`,
+    });
+
+    const globalRows = globalResponse.data.values || [];
+    const globalIndex = globalRows.findIndex(row => (row[0] || '') === notificationId);
+
+    if (globalIndex !== -1) {
+      // Update the notification row
+      globalRows[globalIndex][1] = title;
+      globalRows[globalIndex][2] = message;
+
+      // Calculate the row number in the sheet (offset by 2 because header + 1-based index)
+      const rowNumber = globalIndex + 2;
+
+      // Update the row in the sheet
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: NOTIFICATIONS_SPREADSHEET_ID,
+        range: `${NOTIFICATIONS_SHEET}!A${rowNumber}:D${rowNumber}`,
+        valueInputOption: 'USER_ENTERED',
+        resource: {
+          values: [globalRows[globalIndex]],
+        },
+      });
+
+      return res.json({ success: true, message: 'Notificação global atualizada com sucesso' });
+    }
+
+    // If not found in global, try to update in personal notifications
+    const userResponse = await sheets.spreadsheets.values.get({
+      spreadsheetId: USUARIOS_SPREADSHEET_ID,
+      range: `${USUARIOS_SHEET}!A2:AC`,
+    });
+
+    const userRows = userResponse.data.values || [];
+
+    let notificationFound = false;
+
+    // Iterate over each user row to find and update the notification
+    for (let i = 0; i < userRows.length; i++) {
+      const notificationsJson = userRows[i][28] || '[]'; // Column AC is index 28
+      let notifications = [];
+      try {
+        notifications = JSON.parse(notificationsJson);
+      } catch (e) {
+        notifications = [];
+      }
+
+      const notifIndex = notifications.findIndex(notif => (notif.id || '') === notificationId);
+
+      if (notifIndex !== -1) {
+        // Update the notification
+        notifications[notifIndex].title = title;
+        notifications[notifIndex].message = message;
+
+        // Update the notifications JSON string in the row
+        userRows[i][28] = JSON.stringify(notifications);
+
+        // Update the sheet for this user's notifications column
+        const rowNumber = i + 2; // offset for header and 1-based index
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: USUARIOS_SPREADSHEET_ID,
+          range: `${USUARIOS_SHEET}!AC${rowNumber}:AC${rowNumber}`,
+          valueInputOption: 'USER_ENTERED',
+          resource: {
+            values: [[userRows[i][28]]],
+          },
+        });
+
+        notificationFound = true;
+        break; // Exit loop after updating notification
+      }
+    }
+
+    if (!notificationFound) {
+      return res.status(404).json({ message: 'Notificação não encontrada' });
+    }
+
+    res.json({ success: true, message: 'Notificação atualizada com sucesso' });
+  } catch (error) {
+    console.error('Error updating notification:', error);
+    res.status(500).json({
+      message: 'Erro ao atualizar notificação',
+      error: error.message,
+    });
+  }
+});
+
+// Register client and prospect routes directly in server.js
+
+// Client endpoints
+
+async function startServer() {
+  try {
+    await initializeSheets();
+    const server = app.listen(PORT, () => {
+      console.log(`Server is running on port ${PORT}`);
+    });
+
+    server.on('error', (error) => {
+      if (error.code === 'EADDRINUSE') {
+        console.error(`Port ${PORT} is already in use. Please stop the process using this port or change the port.`);
+      } else {
+        console.error('Server error:', error);
+      }
+    });
+  } catch (error) {
+    console.error('Failed to initialize Google Sheets API. Server not started.');
+  }
+}
+
+startServer();
+
+
+let sheets;
+
+async function initializeSheets() {
+  try {
+    console.log('Initializing Google Sheets API...');
+    const keyFilePath = path.resolve(__dirname, 'google-credentials.json');
+    console.log('Resolved keyFile path:', keyFilePath);
+
+    if (!fs.existsSync(keyFilePath)) {
+      throw new Error(`Google credentials file not found at path: ${keyFilePath}`);
+    }
+
+    const auth = new google.auth.GoogleAuth({
+      keyFile: keyFilePath,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+
+    sheets = google.sheets({ version: 'v4', auth: await auth.getClient() });
+    
+    // Test authentication by trying to access spreadsheets
+    await sheets.spreadsheets.get({
+      spreadsheetId: SPREADSHEET_ID
+    });
+    await sheets.spreadsheets.get({
+      spreadsheetId: PROFILE_SPREADSHEET_ID
+    });
+    await sheets.spreadsheets.get({
+      spreadsheetId: USUARIOS_SPREADSHEET_ID
+    });
+    
+    console.log('Successfully connected to Google Sheets API for all spreadsheets');
+  } catch (error) {
+    console.error('Error initializing Google Sheets:', error);
+    if (error.code === 'ENOENT') {
+      console.error('google-credentials.json file not found');
+    } else if (error.response?.status === 403) {
+      console.error('Authentication failed - check service account permissions');
+    } else if (error.response?.status === 404) {
+      console.error('Spreadsheet not found - check SPREADSHEET_ID or PROFILE_SHEET');
+    }
+    console.error('Full error details:', error);
+    throw error;
+  }
+}
+
+// Get next available client code
+async function getNextClientCode() {
+  try {
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: CLIENTS_SPREADSHEET_ID,
+      range: `${CLIENTS_SHEET}!A2:A`,
+    });
+
+    const values = response.data.values || [];
+    const codes = values.map(row => parseInt(row[0] || '0'));
+    const maxCode = Math.max(0, ...codes);
+    return (maxCode + 1).toString().padStart(6, '0');
+  } catch (error) {
+    console.error('Error getting next client code:', error);
+    throw error;
+  }
+}
+
+// Get next available prospect code
+async function getNextProspectCode() {
+  try {
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${PROSPECTS_SHEET}!A2:A`,
+    });
+
+    const values = response.data.values || [];
+    const codes = values.map(row => parseInt(row[0] || '0'));
+    const maxCode = Math.max(0, ...codes);
+    return (maxCode + 1).toString().padStart(6, '0');
+  } catch (error) {
+    console.error('Error getting next prospect code:', error);
+    throw error;
+  }
+}
+
+// Get next available indicador code
+async function getNextIndicadorCode() {
+  try {
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: INDICADOR_SPREADSHEET_ID,
+      range: `${INDICADOR_SHEET}!A2:A`,
+    });
+
+    const values = response.data.values || [];
+    const codes = values.map(row => parseInt(row[0] || '0'));
+    const maxCode = Math.max(0, ...codes);
+    return (maxCode + 1).toString().padStart(6, '0');
+  } catch (error) {
+    console.error('Error getting next indicador code:', error);
+    throw error;
+  }
+}
+
+// Get next available usuario code
+async function getNextUsuarioCode() {
+  try {
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: USUARIOS_SPREADSHEET_ID,
+      range: `${USUARIOS_SHEET}!A2:A`,
+    });
+
+    const values = response.data.values || [];
+    const codes = values.map(row => parseInt(row[0] || '0'));
+    const maxCode = Math.max(0, ...codes);
+    return (maxCode + 1).toString().padStart(6, '0');
+  } catch (error) {
+    console.error('Error getting next usuario code:', error);
+    throw error;
+  }
+}
+
+// Client endpoints
+app.post('/api/clients', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    console.log('Received client data:', req.body);
+    console.log('Spreadsheet ID:', CLIENTS_SPREADSHEET_ID);
+    console.log('Sheet name:', CLIENTS_SHEET);
+
+    // First, verify we can access the spreadsheet
+    try {
+      const sheetInfo = await sheets.spreadsheets.get({
+        spreadsheetId: CLIENTS_SPREADSHEET_ID
+      });
+      console.log('Successfully accessed spreadsheet:', sheetInfo.data.properties.title);
+    } catch (error) {
+      console.error('Error accessing spreadsheet:', error);
+      throw new Error(`Cannot access spreadsheet: ${error.message}`);
+    }
+
+    const clientData = req.body;
+    
+    // Validate required fields
+    if (!clientData.nome) {
+      return res.status(400).json({
+        success: false,
+        message: 'Nome/Razão Social é obrigatório'
+      });
+    }
+
+    if (!clientData.setor) {
+      return res.status(400).json({
+        success: false,
+        message: 'Setor é obrigatório'
+      });
+    }
+
+    console.log('Getting next client code...');
+    const clientCode = await getNextClientCode();
+    console.log('Generated client code:', clientCode);
+    
+    // Prepare row data with explicit type conversion
+    const rowData = [
+      clientCode,
+      String(clientData.tipo || ''),
+      String(clientData.cpf || ''),
+      String(clientData.nome || ''),
+      String(clientData.setor || ''),
+      String(clientData.contribuinteICMS || 'Não'),
+      String(clientData.inscricaoEstadual || ''),
+      String(clientData.inscricaoMunicipal || ''),
+      String(clientData.representante || ''),
+      String(clientData.telefone || ''),
+      String(clientData.celular || ''),
+      String(clientData.email || ''),
+      String(clientData.cep || ''),
+      String(clientData.logradouro || ''),
+      String(clientData.numero || ''),
+      String(clientData.complemento || ''),
+      String(clientData.bairro || ''),
+      String(clientData.cidade || ''),
+      String(clientData.estado || ''),
+      String(clientData.followUp || ''),
+      new Date().toISOString(), // Data de cadastro
+    ];
+
+    console.log('Row data to append:', rowData);
+    console.log('Appending data to sheet...');
+    
+    const appendResponse = await sheets.spreadsheets.values.append({
+      spreadsheetId: CLIENTS_SPREADSHEET_ID,
+      range: `${CLIENTS_SHEET}!A:U`,
+      valueInputOption: 'USER_ENTERED',
+      resource: {
+        values: [rowData],
+      },
+    });
+    console.log('Sheet response:', appendResponse.data);
+
+    res.json({ 
+      success: true, 
+      message: 'Cliente cadastrado com sucesso',
+      clientCode 
+    });
+  } catch (error) {
+    console.error('Error creating client:', error);
+    console.error('Error details:', {
+      message: error.message,
+      stack: error.stack,
+      response: error.response?.data
+    });
+    
+    let errorMessage = 'Erro ao cadastrar cliente';
+    if (error.message.includes('API not initialized')) {
+      errorMessage = 'Erro de conexão com Google Sheets';
+    } else if (error.response?.status === 403) {
+      errorMessage = 'Erro de permissão ao acessar a planilha';
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      message: errorMessage,
+      error: error.message 
+    });
+  }
+});
+
+// New GET endpoint to fetch all clients with optional filtering
+app.get('/api/clients', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const { code, cpfCnpj, name, representative, sector } = req.query;
+
+    // Fetch all clients from the sheet
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: CLIENTS_SPREADSHEET_ID,
+      range: `${CLIENTS_SHEET}!A2:U`,
+    });
+
+    const rows = response.data.values || [];
+
+    // Map rows to client objects
+    const clients = rows.map(row => ({
+      id: row[0] || '',
+      code: row[0] || '',
+      tipo: row[1] || '',
+      cpfCnpj: row[2] || '',
+      name: row[3] || '',
+      setor: row[4] || '',
+      contribuinteICMS: row[5] || '',
+      inscricaoEstadual: row[6] || '',
+      inscricaoMunicipal: row[7] || '',
+      representante: row[8] || '',
+      telefone: row[9] || '',
+      celular: row[10] || '',
+      email: row[11] || '',
+      cep: row[12] || '',
+      logradouro: row[13] || '',
+      numero: row[14] || '',
+      complemento: row[15] || '',
+      bairro: row[16] || '',
+      cidade: row[17] || '',
+      estado: row[18] || '',
+      followUp: row[19] || '',
+      dataCadastro: row[20] || '',
+    }));
+
+    // Filter clients based on query parameters
+    const filteredClients = clients.filter(client => {
+      if (code && (!client.code || !client.code.includes(code))) return false;
+      if (cpfCnpj) {
+        const cleanSearchCpfCnpj = cpfCnpj.replace(/\D/g, '');
+        const cleanClientCpfCnpj = (client.cpfCnpj || '').replace(/\D/g, '');
+        if (!cleanClientCpfCnpj.includes(cleanSearchCpfCnpj)) return false;
+      }
+      if (name && (!client.name || !client.name.toLowerCase().includes(name.toLowerCase()))) return false;
+      if (representative && (!client.representante || !client.representante.includes(representative))) return false;
+      if (sector && (!client.setor || !client.setor.includes(sector))) return false;
+      return true;
+    });
+
+    res.json({ clients: filteredClients });
+  } catch (error) {
+    console.error('Error fetching clients:', error);
+    res.status(500).json({
+      message: 'Erro ao buscar clientes',
+      error: error.message,
+    });
+  }
+});
+
+// New GET endpoint to fetch a single client by ID
+app.get('/api/clients/:id', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const clientId = req.params.id;
+
+    // Fetch all clients from the sheet
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: CLIENTS_SPREADSHEET_ID,
+      range: `${CLIENTS_SHEET}!A2:U`,
+    });
+
+    const rows = response.data.values || [];
+
+    // Find client by ID
+    const row = rows.find(row => row[0] === clientId);
+
+    if (!row) {
+      return res.status(404).json({ message: 'Cliente não encontrado' });
+    }
+
+    // Map row to client object
+    const client = {
+      id: row[0] || '',
+      code: row[0] || '',
+      tipo: row[1] || '',
+      cpf: row[2] || '',
+      nome: row[3] || '',
+      setor: row[4] || '',
+      contribuinteICMS: row[5] || '',
+      inscricaoEstadual: row[6] || '',
+      inscricaoMunicipal: row[7] || '',
+      representante: row[8] || '',
+      telefone: row[9] || '',
+      celular: row[10] || '',
+      email: row[11] || '',
+      cep: row[12] || '',
+      logradouro: row[13] || '',
+      numero: row[14] || '',
+      complemento: row[15] || '',
+      bairro: row[16] || '',
+      cidade: row[17] || '',
+      estado: row[18] || '',
+      followUp: row[19] || '',
+      dataCadastro: row[20] || '',
+    };
+
+    res.json(client);
+  } catch (error) {
+    console.error('Error fetching client:', error);
+    res.status(500).json({
+      message: 'Erro ao buscar cliente',
+      error: error.message,
+    });
+  }
+});
+
+// DELETE endpoint to delete client by ID
+app.delete('/api/clients/:id', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const clientId = req.params.id;
+
+    // Fetch all clients from the sheet
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: CLIENTS_SPREADSHEET_ID,
+      range: `${CLIENTS_SHEET}!A2:U`,
+    });
+
+    const rows = response.data.values || [];
+
+    // Find index of client by ID
+    const clientIndex = rows.findIndex(row => row[0] === clientId);
+
+    if (clientIndex === -1) {
+      return res.status(404).json({ message: 'Cliente não encontrado' });
+    }
+
+    // Remove the client row from the array
+    rows.splice(clientIndex, 1);
+
+    // Clear the existing data range (except header)
+    await sheets.spreadsheets.values.clear({
+      spreadsheetId: CLIENTS_SPREADSHEET_ID,
+      range: `${CLIENTS_SHEET}!A2:U`,
+    });
+
+    // Append the updated rows back to the sheet
+    if (rows.length > 0) {
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: CLIENTS_SPREADSHEET_ID,
+        range: `${CLIENTS_SHEET}!A2:U`,
+        valueInputOption: 'USER_ENTERED',
+        resource: {
+          values: rows,
+        },
+      });
+    }
+
+    res.json({ success: true, message: 'Cliente apagado com sucesso' });
+  } catch (error) {
+    console.error('Error deleting client:', error);
+    res.status(500).json({
+      message: 'Erro ao apagar cliente',
+      error: error.message,
+    });
+  }
+});
+
+// PUT endpoint to update client by ID with partial update support
+app.put('/api/clients/:id', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const clientId = req.params.id;
+    const updateData = req.body;
+
+    // Fetch all clients from the sheet
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: CLIENTS_SPREADSHEET_ID,
+      range: `${CLIENTS_SHEET}!A2:U`,
+    });
+
+    const rows = response.data.values || [];
+
+    // Find index of client by ID
+    const clientIndex = rows.findIndex(row => row[0] === clientId);
+
+    if (clientIndex === -1) {
+      return res.status(404).json({ message: 'Cliente não encontrado' });
+    }
+
+    // Get the existing row to preserve fields not sent in update
+    const existingRow = rows[clientIndex];
+
+    // Map existing row to object for easier update
+    const existingData = {
+      id: existingRow[0] || '',
+      tipo: existingRow[1] || '',
+      cpf: existingRow[2] || '',
+      nome: existingRow[3] || '',
+      setor: existingRow[4] || '',
+      contribuinteICMS: existingRow[5] || 'Não',
+      inscricaoEstadual: existingRow[6] || '',
+      inscricaoMunicipal: existingRow[7] || '',
+      representante: existingRow[8] || '',
+      telefone: existingRow[9] || '',
+      celular: existingRow[10] || '',
+      email: existingRow[11] || '',
+      cep: existingRow[12] || '',
+      logradouro: existingRow[13] || '',
+      numero: existingRow[14] || '',
+      complemento: existingRow[15] || '',
+      bairro: existingRow[16] || '',
+      cidade: existingRow[17] || '',
+      estado: existingRow[18] || '',
+      followUp: existingRow[19] || '',
+      dataCadastro: existingRow[20] || '',
+    };
+
+    // Merge updateData into existingData, only overwrite fields provided
+    const mergedData = {
+      ...existingData,
+      ...updateData,
+    };
+
+    // Prepare updated row data array
+    const updatedRow = [
+      mergedData.id,
+      mergedData.tipo,
+      mergedData.cpf,
+      mergedData.nome,
+      mergedData.setor,
+      mergedData.contribuinteICMS,
+      mergedData.inscricaoEstadual,
+      mergedData.inscricaoMunicipal,
+      mergedData.representante,
+      mergedData.telefone,
+      mergedData.celular,
+      mergedData.email,
+      mergedData.cep,
+      mergedData.logradouro,
+      mergedData.numero,
+      mergedData.complemento,
+      mergedData.bairro,
+      mergedData.cidade,
+      mergedData.estado,
+      mergedData.followUp,
+      mergedData.dataCadastro,
+    ];
+
+    // Calculate the row number in the sheet (offset by 2 because header + 1-based index)
+    const rowNumber = clientIndex + 2;
+
+    // Update the row in the sheet
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: CLIENTS_SPREADSHEET_ID,
+      range: `${CLIENTS_SHEET}!A${rowNumber}:U${rowNumber}`,
+      valueInputOption: 'USER_ENTERED',
+      resource: {
+        values: [updatedRow],
+      },
+    });
+
+    res.json({ success: true, message: 'Cliente atualizado com sucesso' });
+  } catch (error) {
+    console.error('Error updating client:', error);
+    res.status(500).json({
+      message: 'Erro ao atualizar cliente',
+      error: error.message,
+    });
+  }
+});
+app.post('/api/prospects', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    console.log('Received prospect data:', req.body);
+    console.log('Spreadsheet ID:', SPREADSHEET_ID);
+    console.log('Sheet name:', PROSPECTS_SHEET);
+
+    // First, verify we can access the spreadsheet
+    try {
+      const sheetInfo = await sheets.spreadsheets.get({
+        spreadsheetId: SPREADSHEET_ID
+      });
+      console.log('Successfully accessed spreadsheet:', sheetInfo.data.properties.title);
+    } catch (error) {
+      console.error('Error accessing spreadsheet:', error);
+      throw new Error(`Cannot access spreadsheet: ${error.message}`);
+    }
+
+    const prospectData = req.body;
+    
+    // Validate required fields
+    if (!prospectData.nome) {
+      return res.status(400).json({
+        success: false,
+        message: 'Nome/Razão Social é obrigatório'
+      });
+    }
+
+    if (!prospectData.setor) {
+      return res.status(400).json({
+        success: false,
+        message: 'Setor é obrigatório'
+      });
+    }
+
+    // Check for duplicate CPF/CNPJ
+    const responseAll = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${PROSPECTS_SHEET}!A2:V`,
+    });
+    const rows = responseAll.data.values || [];
+    const normalizeCpfCnpj = (value) => value.replace(/\D/g, '');
+    const existingProspect = rows.find(row => {
+      const cpfCnpj = row[3] || '';
+      return cpfCnpj && normalizeCpfCnpj(cpfCnpj) === normalizeCpfCnpj(prospectData.cpf);
+    });
+    if (existingProspect) {
+      return res.status(400).json({
+        success: false,
+        message: `Já existe um prospect cadastrado com esse CPF/CNPJ. Código: ${existingProspect[0]}`
+      });
+    }
+
+    console.log('Getting next prospect code...');
+    const prospectCode = await getNextProspectCode();
+    console.log('Generated prospect code:', prospectCode);
+    
+    // Prepare row data with explicit type conversion
+    const rowData = [
+      prospectCode,                          // Column A
+      String(prospectData.email || ''),     // Column B (email)
+      String(prospectData.tipo || ''),      // Column C
+      String(prospectData.cpf || ''),       // Column D
+      String(prospectData.nome || ''),      // Column E
+      String(prospectData.setor || ''),     // Column F
+      String(prospectData.telefone || ''),  // Column G (telefone)
+      String(prospectData.contribuinteICMS || 'Não'), // Column H
+      String(prospectData.cidade || ''),    // Column I (cidade)
+      String(prospectData.estado || ''),    // Column J (estado)
+      String(prospectData.cep || ''),       // Column K (cep)
+      String(prospectData.followUp || ''),  // Column L (followUp)
+      String(prospectData.inscricaoEstadual || ''),   // Column M
+      String(prospectData.inscricaoMunicipal || ''),  // Column N
+      String(prospectData.representante || ''),       // Column O
+      String(prospectData.celular || ''),              // Column P
+      String(prospectData.logradouro || ''),           // Column Q
+      String(prospectData.numero || ''),                // Column R
+      String(prospectData.complemento || ''),           // Column S
+      String(prospectData.bairro || ''),                // Column T
+      // Store tags as JSON string (array of objects with name and color)
+      String(prospectData.tags ? JSON.stringify(prospectData.tags) : '[]'), // Column U (tags)
+      new Date().toISOString(), // Data de cadastro       // Column V
+    ];
+
+    console.log('Row data to append:', rowData);
+    console.log('Appending data to sheet...');
+    
+    const appendResponse = await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${PROSPECTS_SHEET}!A:V`,
+      valueInputOption: 'USER_ENTERED',
+      resource: {
+        values: [rowData],
+      },
+    });
+    console.log('Sheet response:', appendResponse.data);
+
+    res.json({ 
+      success: true, 
+      message: 'Prospect cadastrado com sucesso',
+      prospectCode 
+    });
+  } catch (error) {
+    console.error('Error creating prospect:', error);
+    console.error('Error details:', {
+      message: error.message,
+      stack: error.stack,
+      response: error.response?.data
+    });
+    
+    let errorMessage = 'Erro ao cadastrar prospect';
+    if (error.message.includes('API not initialized')) {
+      errorMessage = 'Erro de conexão com Google Sheets';
+    } else if (error.response?.status === 403) {
+      errorMessage = 'Erro de permissão ao acessar a planilha';
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      message: errorMessage,
+      error: error.message 
+    });
+  }
+});
+// PUT endpoint to update prospect by ID with partial update support
+app.put('/api/prospects/:id', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const prospectId = req.params.id;
+    const updateData = req.body;
+
+    // Fetch all prospects from the sheet
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${PROSPECTS_SHEET}!A2:V`,
+    });
+
+    const rows = response.data.values || [];
+
+    // Find index of prospect by ID
+    const prospectIndex = rows.findIndex(row => row[0] === prospectId);
+
+    if (prospectIndex === -1) {
+      return res.status(404).json({ message: 'Prospect não encontrado' });
+    }
+
+    // Get the existing row to preserve fields not sent in update
+    const existingRow = rows[prospectIndex];
+
+    // Map existing row to object for easier update
+    const existingData = {
+      id: existingRow[0] || '',
+      email: existingRow[1] || '',
+      tipo: existingRow[2] || '',
+      cpfCnpj: existingRow[3] || '',
+      name: existingRow[4] || '',
+      setor: existingRow[5] || '',
+      telefone: existingRow[6] || '',
+      contribuinteICMS: existingRow[7] || 'Não',
+      cidade: existingRow[8] || '',
+      estado: existingRow[9] || '',
+      cep: existingRow[10] || '',
+      followUp: existingRow[11] || '',
+      inscricaoEstadual: existingRow[12] || '',
+      inscricaoMunicipal: existingRow[13] || '',
+      representante: existingRow[14] || '',
+      celular: existingRow[15] || '',
+      logradouro: existingRow[16] || '',
+      numero: existingRow[17] || '',
+      complemento: existingRow[18] || '',
+      bairro: existingRow[19] || '',
+      tags: existingRow[20] || '',
+      dataCadastro: existingRow[21] || '',
+    };
+
+    // Merge updateData into existingData, only overwrite fields provided
+    const mergedData = {
+      ...existingData,
+      ...updateData,
+    };
+
+    // Ensure tags is a string for Google Sheets (array of objects with name and color)
+    if (Array.isArray(mergedData.tags)) {
+      mergedData.tags = JSON.stringify(mergedData.tags);
+    } else if (!mergedData.tags) {
+      mergedData.tags = '[]';
+    }
+
+    // Prepare updated row data array
+    const updatedRow = [
+      mergedData.id,
+      mergedData.email,
+      mergedData.tipo,
+      mergedData.cpfCnpj,
+      mergedData.name,
+      mergedData.setor,
+      mergedData.telefone,
+      mergedData.contribuinteICMS,
+      mergedData.cidade,
+      mergedData.estado,
+      mergedData.cep,
+      mergedData.followUp,
+      mergedData.inscricaoEstadual,
+      mergedData.inscricaoMunicipal,
+      mergedData.representante,
+      mergedData.celular,
+      mergedData.logradouro,
+      mergedData.numero,
+      mergedData.complemento,
+      mergedData.bairro,
+      mergedData.tags,
+      mergedData.dataCadastro,
+    ];
+
+    // Calculate the row number in the sheet (offset by 2 because header + 1-based index)
+    const rowNumber = prospectIndex + 2;
+
+    // Update the row in the sheet
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${PROSPECTS_SHEET}!A${rowNumber}:V${rowNumber}`,
+      valueInputOption: 'USER_ENTERED',
+      resource: {
+        values: [updatedRow],
+      },
+    });
+
+    res.json({ success: true, message: 'Prospect atualizado com sucesso' });
+  } catch (error) {
+    console.error('Error updating prospect:', error);
+    res.status(500).json({
+      message: 'Erro ao atualizar prospect',
+      error: error.message,
+    });
+  }
+});
+// DELETE endpoint to delete prospect by ID
+app.delete('/api/prospects/:id', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const prospectId = req.params.id;
+
+    // Fetch all prospects from the sheet
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${PROSPECTS_SHEET}!A2:V`,
+    });
+
+    const rows = response.data.values || [];
+
+    // Find index of prospect by ID
+    const prospectIndex = rows.findIndex(row => row[0] === prospectId);
+
+    if (prospectIndex === -1) {
+      return res.status(404).json({ message: 'Prospect não encontrado' });
+    }
+
+    // Remove the prospect row from the array
+    rows.splice(prospectIndex, 1);
+
+    // Clear the existing data range (except header)
+    await sheets.spreadsheets.values.clear({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${PROSPECTS_SHEET}!A2:V`,
+    });
+
+    // Append the updated rows back to the sheet
+    if (rows.length > 0) {
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: SPREADSHEET_ID,
+        range: `${PROSPECTS_SHEET}!A2:V`,
+        valueInputOption: 'USER_ENTERED',
+        resource: {
+          values: rows,
+        },
+      });
+    }
+
+    res.json({ success: true, message: 'Prospect apagado com sucesso' });
+  } catch (error) {
+    console.error('Error deleting prospect:', error);
+    res.status(500).json({
+      message: 'Erro ao apagar prospect',
+      error: error.message,
+    });
+  }
+});
+
+// New GET endpoint to fetch all prospects
+app.get('/api/prospects', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const { code, cpfCnpj, name, representative, sector } = req.query;
+
+    // Fetch all prospects from the sheet
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${PROSPECTS_SHEET}!A2:V`,
+    });
+
+    const rows = response.data.values || [];
+
+    // Map rows to prospect objects
+const prospects = rows.map(row => {
+      let tags = [];
+      if (row[20]) {
+        try {
+          tags = JSON.parse(row[20]);
+        } catch (e) {
+          console.warn(`Failed to parse tags JSON for prospect ID ${row[0]}:`, e);
+          tags = [row[20]]; // fallback to array with raw string
+        }
+      }
+      return {
+        id: row[0] || '',
+        code: row[0] || '',
+        email: row[1] || '',
+        tipo: row[2] || '',
+        cpfCnpj: row[3] || '',
+        name: row[4] || '',
+        setor: row[5] || '',
+        telefone: row[6] || '',
+        contribuinteICMS: row[7] || '',
+        cidade: row[8] || '',
+        estado: row[9] || '',
+        cep: row[10] || '',
+        followUp: row[11] || '',
+        inscricaoEstadual: row[12] || '',
+        inscricaoMunicipal: row[13] || '',
+        representante: row[14] || '',
+        celular: row[15] || '',
+        logradouro: row[16] || '',
+        numero: row[17] || '',
+        complemento: row[18] || '',
+        bairro: row[19] || '',
+        tags: tags,
+        dataCadastro: row[21] || '',
+      };
+    });
+
+    // Filter prospects based on query parameters
+    const filteredProspects = prospects.filter(prospect => {
+      if (code && (!prospect.code || !prospect.code.includes(code))) return false;
+      if (cpfCnpj) {
+        const cleanSearchCpfCnpj = cpfCnpj.replace(/\D/g, '');
+        const cleanProspectCpfCnpj = (prospect.cpfCnpj || '').replace(/\D/g, '');
+        if (!cleanProspectCpfCnpj.includes(cleanSearchCpfCnpj)) return false;
+      }
+      if (name && (!prospect.name || !prospect.name.toLowerCase().includes(name.toLowerCase()))) return false;
+      if (representative && (!prospect.representante || !prospect.representante.includes(representative))) return false;
+      if (sector && (!prospect.setor || !prospect.setor.includes(sector))) return false;
+      return true;
+    });
+
+    res.json({ prospects: filteredProspects });
+  } catch (error) {
+    console.error('Error fetching prospects:', error);
+    res.status(500).json({
+      message: 'Erro ao buscar prospects',
+      error: error.message,
+    });
+  }
+});
+
+// New GET endpoint to fetch a single prospect by ID
+app.get('/api/prospects/:id', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const prospectId = req.params.id;
+
+    // Fetch all prospects from the sheet
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${PROSPECTS_SHEET}!A2:V`,
+    });
+
+    const rows = response.data.values || [];
+
+    // Find prospect by ID
+    const row = rows.find(row => row[0] === prospectId);
+
+    if (!row) {
+      return res.status(404).json({ message: 'Prospect não encontrado' });
+    }
+
+    // Map row to prospect object
+    const prospect = {
+      id: row[0] || '',
+      code: row[0] || '',
+      email: row[1] || '',
+      tipo: row[2] || '',
+      cpfCnpj: row[3] || '',
+      name: row[4] || '',
+      setor: row[5] || '',
+      telefone: row[6] || '',
+      contribuinteICMS: row[7] || '',
+      cidade: row[8] || '',
+      estado: row[9] || '',
+      cep: row[10] || '',
+      followUp: row[11] || '',
+      inscricaoEstadual: row[12] || '',
+      inscricaoMunicipal: row[13] || '',
+      representante: row[14] || '',
+      celular: row[15] || '',
+      logradouro: row[16] || '',
+      numero: row[17] || '',
+      complemento: row[18] || '',
+      bairro: row[19] || '',
+      tags: row[20] ? JSON.parse(row[20]) : [],
+      dataCadastro: row[21] || '',
+    };
+
+    res.json({ prospect });
+  } catch (error) {
+    console.error('Error fetching prospect:', error);
+    res.status(500).json({
+      message: 'Erro ao buscar prospect',
+      error: error.message,
+    });
+  }
+});
+
+// New GET endpoint to fetch a single indicador by ID
+app.get('/api/indicador/:id', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const indicadorId = req.params.id;
+
+    // Fetch all indicadores from the sheet
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: INDICADOR_SPREADSHEET_ID,
+      range: `${INDICADOR_SHEET}!A2:V`,
+    });
+
+    const rows = response.data.values || [];
+
+    // Find indicador by ID
+    const row = rows.find(row => row[0] === indicadorId);
+
+    if (!row) {
+      return res.status(404).json({ message: 'Indicador não encontrado' });
+    }
+
+    // Map row to indicador object
+    const indicador = {
+      id: row[0] || '',
+      code: row[0] || '',
+      email: row[1] || '',
+      tipo: row[2] || '',
+      cpfCnpj: row[3] || '',
+      name: row[4] || '',
+      setor: row[5] || '',
+      telefone: row[6] || '',
+      contribuinteICMS: row[7] || '',
+      cidade: row[8] || '',
+      estado: row[9] || '',
+      cep: row[10] || '',
+      followUp: row[11] || '',
+      inscricaoEstadual: row[12] || '',
+      inscricaoMunicipal: row[13] || '',
+      representante: row[14] || '',
+      celular: row[15] || '',
+      logradouro: row[16] || '',
+      numero: row[17] || '',
+      complemento: row[18] || '',
+      bairro: row[19] || '',
+      tags: row[20] ? JSON.parse(row[20]) : [],
+      dataCadastro: row[21] || '',
+    };
+
+    res.json({ indicador });
+  } catch (error) {
+    console.error('Error fetching indicador:', error);
+    res.status(500).json({
+      message: 'Erro ao buscar indicador',
+      error: error.message,
+    });
+  }
+});
+
+// New GET endpoint to fetch indicadores with optional filtering
+app.get('/api/indicador', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const { code, cpfCnpj, name, representative, sector } = req.query;
+
+    // Fetch all indicadores from the sheet
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: INDICADOR_SPREADSHEET_ID,
+      range: `${INDICADOR_SHEET}!A2:V`,
+    });
+
+    const rows = response.data.values || [];
+
+    // Map rows to indicador objects
+    const indicadores = rows.map(row => ({
+      id: row[0] || '',
+      code: row[0] || '',
+      email: row[1] || '',
+      tipo: row[2] || '',
+      cpfCnpj: row[3] || '',
+      name: row[4] || '',
+      setor: row[5] || '',
+      telefone: row[6] || '',
+      contribuinteICMS: row[7] || '',
+      cidade: row[8] || '',
+      estado: row[9] || '',
+      cep: row[10] || '',
+      followUp: row[11] || '',
+      inscricaoEstadual: row[12] || '',
+      inscricaoMunicipal: row[13] || '',
+      representante: row[14] || '',
+      celular: row[15] || '',
+      logradouro: row[16] || '',
+      numero: row[17] || '',
+      complemento: row[18] || '',
+      bairro: row[19] || '',
+      tags: row[20] ? JSON.parse(row[20]) : [],
+      dataCadastro: row[21] || '',
+    }));
+
+    // Filter indicadores based on query parameters
+    const filteredIndicadores = indicadores.filter(indicador => {
+      if (code && (!indicador.code || !indicador.code.includes(code))) return false;
+      if (cpfCnpj) {
+        const cleanSearchCpfCnpj = cpfCnpj.replace(/\D/g, '');
+        const cleanIndicadorCpfCnpj = (indicador.cpfCnpj || '').replace(/\D/g, '');
+        if (!cleanIndicadorCpfCnpj.includes(cleanSearchCpfCnpj)) return false;
+      }
+      if (name && (!indicador.name || !indicador.name.toLowerCase().includes(name.toLowerCase()))) return false;
+      if (representative && (!indicador.representante || !indicador.representante.includes(representative))) return false;
+      if (sector && (!indicador.setor || !indicador.setor.includes(sector))) return false;
+      return true;
+    });
+
+    res.json({ indicadores: filteredIndicadores });
+  } catch (error) {
+    console.error('Error fetching indicadores:', error);
+    res.status(500).json({
+      message: 'Erro ao buscar indicadores',
+      error: error.message,
+    });
+  }
+});
+
+// PUT endpoint to update indicador by ID with partial update support
+app.put('/api/indicador/:id', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const indicadorId = req.params.id;
+    const updateData = req.body;
+
+    // Fetch all indicadores from the sheet
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: INDICADOR_SPREADSHEET_ID,
+      range: `${INDICADOR_SHEET}!A2:V`,
+    });
+
+    const rows = response.data.values || [];
+
+    // Find index of indicador by ID
+    const indicadorIndex = rows.findIndex(row => row[0] === indicadorId);
+
+    if (indicadorIndex === -1) {
+      return res.status(404).json({ message: 'Indicador não encontrado' });
+    }
+
+    // Get the existing row to preserve fields not sent in update
+    const existingRow = rows[indicadorIndex];
+
+    // Map existing row to object for easier update
+    const existingData = {
+      id: existingRow[0] || '',
+      email: existingRow[1] || '',
+      tipo: existingRow[2] || '',
+      cpfCnpj: existingRow[3] || '',
+      name: existingRow[4] || '',
+      setor: existingRow[5] || '',
+      telefone: existingRow[6] || '',
+      contribuinteICMS: existingRow[7] || '',
+      cidade: existingRow[8] || '',
+      estado: existingRow[9] || '',
+      cep: existingRow[10] || '',
+      followUp: existingRow[11] || '',
+      inscricaoEstadual: existingRow[12] || '',
+      inscricaoMunicipal: existingRow[13] || '',
+      representante: existingRow[14] || '',
+      celular: existingRow[15] || '',
+      logradouro: existingRow[16] || '',
+      numero: existingRow[17] || '',
+      complemento: existingRow[18] || '',
+      bairro: existingRow[19] || '',
+      tags: existingRow[20] || '',
+      dataCadastro: existingRow[21] || '',
+    };
+
+    // Merge updateData into existingData, only overwrite fields provided
+    const mergedData = {
+      ...existingData,
+      ...updateData,
+    };
+
+    // Ensure tags is a string for Google Sheets
+    if (Array.isArray(mergedData.tags)) {
+      mergedData.tags = JSON.stringify(mergedData.tags);
+    } else if (!mergedData.tags) {
+      mergedData.tags = '[]';
+    }
+
+    // Prepare updated row data array
+    const updatedRow = [
+      mergedData.id,
+      mergedData.email,
+      mergedData.tipo,
+      mergedData.cpfCnpj,
+      mergedData.name,
+      mergedData.setor,
+      mergedData.telefone,
+      mergedData.contribuinteICMS,
+      mergedData.cidade,
+      mergedData.estado,
+      mergedData.cep,
+      mergedData.followUp,
+      mergedData.inscricaoEstadual,
+      mergedData.inscricaoMunicipal,
+      mergedData.representante,
+      mergedData.celular,
+      mergedData.logradouro,
+      mergedData.numero,
+      mergedData.complemento,
+      mergedData.bairro,
+      mergedData.tags,
+      mergedData.dataCadastro,
+    ];
+
+    // Calculate the row number in the sheet (offset by 2 because header + 1-based index)
+    const rowNumber = indicadorIndex + 2;
+
+    // Update the row in the sheet
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: INDICADOR_SPREADSHEET_ID,
+      range: `${INDICADOR_SHEET}!A${rowNumber}:V${rowNumber}`,
+      valueInputOption: 'USER_ENTERED',
+      resource: {
+        values: [updatedRow],
+      },
+    });
+
+    res.json({ success: true, message: 'Indicador atualizado com sucesso' });
+  } catch (error) {
+    console.error('Error updating indicador:', error);
+    res.status(500).json({
+      message: 'Erro ao atualizar indicador',
+      error: error.message,
+    });
+  }
+});
+
+app.post('/api/usuarios', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    console.log('Received usuario data:', req.body);
+    console.log('Spreadsheet ID:', USUARIOS_SPREADSHEET_ID);
+    console.log('Sheet name:', USUARIOS_SHEET);
+
+    // First, verify we can access the spreadsheet
+    try {
+      const sheetInfo = await sheets.spreadsheets.get({
+        spreadsheetId: USUARIOS_SPREADSHEET_ID
+      });
+      console.log('Successfully accessed spreadsheet:', sheetInfo.data.properties.title);
+    } catch (error) {
+      console.error('Error accessing spreadsheet:', error);
+      throw new Error(`Cannot access spreadsheet: ${error.message}`);
+    }
+
+    const usuarioData = req.body;
+
+    // Validate required fields (example: nome and email)
+    if (!usuarioData.nome) {
+      return res.status(400).json({
+        success: false,
+        message: 'Nome é obrigatório'
+      });
+    }
+
+    if (!usuarioData.email) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email é obrigatório'
+      });
+    }
+
+    console.log('Getting next usuario code...');
+    const usuarioCode = await getNextUsuarioCode();
+    console.log('Generated usuario code:', usuarioCode);
+
+    // Prepare row data with explicit type conversion
+    const rowData = [
+      usuarioCode,                              // A: Id do Usuario
+      String(usuarioData.nome || ''),           // B: nome
+      String(usuarioData.nomeUsuario || ''),    // C: nomeUsuario
+      String(usuarioData.email || ''),          // D: email
+      String(usuarioData.filial || ''),         // E: filial (added)
+      String(usuarioData.cpf || ''),            // F: cpf (shifted)
+      String(usuarioData.celular || ''),        // G: celular (shifted)
+      String(usuarioData.cargo || ''),          // H: cargo (shifted)
+      String(usuarioData.cep || ''),            // I: cep (shifted)
+      String(usuarioData.logradouro || ''),     // J: logradouro (shifted)
+      String(usuarioData.numero || ''),         // K: numero (shifted)
+      String(usuarioData.complemento || ''),    // L: complemento (shifted)
+      String(usuarioData.bairro || ''),         // M: bairro (shifted)
+      String(usuarioData.cidade || ''),         // N: cidade (shifted)
+      String(usuarioData.estado || ''),         // O: estado (shifted)
+      String(usuarioData.dataAdmissao || ''),   // P: dataAdmissao (shifted)
+      String(usuarioData.statusUsuario || ''),  // Q: statusUsuario (shifted)
+      String(usuarioData.permissoes || ''),     // R: permissoes (shifted)
+      String(usuarioData.senha || ''),          // S: senha (shifted)
+      String(usuarioData.salarioFixo || ''),    // T: salarioFixo (shifted)
+      String(usuarioData.comissao1 || ''),      // U: comissao1 (shifted)
+      String(usuarioData.comissao2 || ''),      // V: comissao2 (shifted)
+      String(usuarioData.comissao3 || ''),      // W: comissao3 (shifted)
+      String(usuarioData.comissao4 || ''),      // X: comissao4 (shifted)
+      String(usuarioData.bonus || ''),          // Y: bonus (shifted)
+      String(usuarioData.observacoes || ''),    // Z: observacoes (shifted)
+      String(usuarioData.imagem || ''),         // AA: imagem (new column for image base64)
+      new Date().toISOString(),                  // AB: Data de criação (shifted to AB)
+    ];
+
+    console.log('Row data to append:', rowData);
+    console.log('Appending data to sheet...');
+
+    const appendResponse = await sheets.spreadsheets.values.append({
+      spreadsheetId: USUARIOS_SPREADSHEET_ID,
+      range: `${USUARIOS_SHEET}!A:AB`,
+      valueInputOption: 'USER_ENTERED',
+      resource: {
+        values: [rowData],
+      },
+    });
+    console.log('Sheet response:', appendResponse.data);
+
+    res.json({
+      success: true,
+      message: 'Usuário cadastrado com sucesso',
+      usuarioCode
+    });
+  } catch (error) {
+    console.error('Error creating usuario:', error);
+    console.error('Error details:', {
+      message: error.message,
+      stack: error.stack,
+      response: error.response?.data
+    });
+
+    let errorMessage = 'Erro ao cadastrar usuário';
+    if (error.message.includes('API not initialized')) {
+      errorMessage = 'Erro de conexão com Google Sheets';
+    } else if (error.response?.status === 403) {
+      errorMessage = 'Erro de permissão ao acessar a planilha';
+    }
+
+    res.status(500).json({
+      success: false,
+      message: errorMessage,
+      error: error.message
+    });
+  }
+});
+
+// GET endpoint to fetch all usuarios
+app.get('/api/usuarios', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    // Fetch all usuarios from the sheet
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: USUARIOS_SPREADSHEET_ID,
+      range: `${USUARIOS_SHEET}!A2:AA`,
+    });
+
+    const rows = response.data.values || [];
+
+    // Map rows to usuario objects
+    const usuarios = rows.map(row => ({
+      id: row[0] || '',
+      code: row[0] || '',
+      nome: row[1] || '',
+      nomeUsuario: row[2] || '',
+      email: row[3] || '',
+      filial: row[4] || '', // replaced telefone with filial
+      cpf: row[5] || '',
+      celular: row[6] || '',
+      cargo: row[7] || '',
+      cep: row[8] || '',
+      logradouro: row[9] || '',
+      numero: row[10] || '',
+      complemento: row[11] || '',
+      bairro: row[12] || '',
+      cidade: row[13] || '',
+      estado: row[14] || '',
+      dataAdmissao: row[15] || '',
+      statusUsuario: row[16] || '',
+      permissoes: row[17] || '',
+      senha: row[18] || '',
+      salarioFixo: row[19] || '',
+      comissao1: row[20] || '',
+      comissao2: row[21] || '',
+      comissao3: row[22] || '',
+      comissao4: row[23] || '',
+      bonus: row[24] || '',
+      observacoes: row[25] || '',
+      imagem: row[26] || '',
+      dataCadastro: row[27] || '',
+    }));
+
+    res.json({ usuarios });
+  } catch (error) {
+    console.error('Error fetching usuarios:', error);
+    res.status(500).json({
+      message: 'Erro ao buscar usuários',
+      error: error.message,
+    });
+  }
+});
+
+// GET endpoint to fetch a single usuario by ID
+app.get('/api/usuarios/:id', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const usuarioId = req.params.id;
+
+    // Fetch all usuarios from the sheet with full range including notifications column AC (index 28)
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: USUARIOS_SPREADSHEET_ID,
+      range: `${USUARIOS_SHEET}!A2:AC`,
+    });
+
+    const rows = response.data.values || [];
+
+    // Find usuario by ID
+    const row = rows.find(row => row[0] === usuarioId);
+
+    if (!row) {
+      return res.status(404).json({ message: 'Usuário não encontrado' });
+    }
+
+    // Extract personal notifications JSON string from column AC (index 28)
+    const personalNotificationsJson = row[28] || '[]';
+
+    // Parse personal notifications and add sender name (from column B, index 1)
+    let personalNotifications = [];
+    try {
+      personalNotifications = JSON.parse(personalNotificationsJson);
+      if (!Array.isArray(personalNotifications)) {
+        personalNotifications = [];
+      }
+    } catch (e) {
+      personalNotifications = [];
+    }
+
+    // Ensure each personal notification has a read flag (default false)
+    personalNotifications = personalNotifications.map(notif => ({
+      ...notif,
+      read: notif.read === true,
+      sender: row[1] || 'Unknown',
+      isGlobal: false,
+    }));
+
+    // Fetch global notifications from NOTIFICATIONS_SHEET
+    const globalResponse = await sheets.spreadsheets.values.get({
+      spreadsheetId: NOTIFICATIONS_SPREADSHEET_ID,
+      range: `${NOTIFICATIONS_SHEET}!A2:D`,
+    });
+
+    const globalRows = globalResponse.data.values || [];
+
+    // Map global notifications with read flag false (since no per-user read tracking)
+    const globalNotifications = globalRows.map(row => ({
+      id: row[0] || '',
+      title: row[1] || '',
+      message: row[2] || '',
+      date: row[3] || '',
+      sender: 'Todos',
+      read: false,
+      isGlobal: true,
+    }));
+
+    // Combine global and personal notifications
+    const notifications = [...globalNotifications, ...personalNotifications];
+
+    // Map row to usuario object with all fields plus combined notifications
+    const usuario = {
+      id: row[0] || '',
+      nome: row[1] || '',
+      nomeUsuario: row[2] || '',
+      email: row[3] || '',
+      filial: row[4] || '', // replaced telefone with filial
+      cpf: row[5] || '',
+      celular: row[6] || '',
+      cargo: row[7] || '',
+      cep: row[8] || '',
+      logradouro: row[9] || '',
+      numero: row[10] || '',
+      complemento: row[11] || '',
+      bairro: row[12] || '',
+      cidade: row[13] || '',
+      estado: row[14] || '',
+      dataAdmissao: row[15] || '',
+      statusUsuario: row[16] || '',
+      permissoes: row[17] || '',
+      senha: row[18] || '',
+      salarioFixo: row[19] || '',
+      comissao1: row[20] || '',
+      comissao2: row[21] || '',
+      comissao3: row[22] || '',
+      comissao4: row[23] || '',
+      bonus: row[24] || '',
+      observacoes: row[25] || '',
+      imagem: row[26] || '',
+      dataCadastro: row[27] || '',
+      notifications: notifications,
+    };
+
+    res.json(usuario);
+  } catch (error) {
+    console.error('Error fetching usuario:', error);
+    res.status(500).json({
+      message: 'Erro ao buscar usuário',
+      error: error.message,
+    });
+  }
+});
+
+// PUT endpoint to update usuario by ID with partial update support
+app.put('/api/usuarios/:id', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const usuarioId = req.params.id;
+    const updateData = req.body;
+
+    // Fetch all usuarios from the sheet
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: USUARIOS_SPREADSHEET_ID,
+      range: `${USUARIOS_SHEET}!A2:AB`,
+    });
+
+    const rows = response.data.values || [];
+
+    // Find index of usuario by ID
+    const usuarioIndex = rows.findIndex(row => row[0] === usuarioId);
+
+    if (usuarioIndex === -1) {
+      return res.status(404).json({ message: 'Usuário não encontrado' });
+    }
+
+    // Get the existing row to preserve fields not sent in update
+    const existingRow = rows[usuarioIndex];
+
+    // Map existing row to object for easier update
+    const existingData = {
+      id: existingRow[0] || '',
+      nome: existingRow[1] || '',
+      nomeUsuario: existingRow[2] || '',
+      email: existingRow[3] || '',
+      filial: existingRow[4] || '', // replaced telefone with filial
+      cpf: existingRow[5] || '',
+      celular: existingRow[6] || '',
+      cargo: existingRow[7] || '',
+      cep: existingRow[8] || '',
+      logradouro: existingRow[9] || '',
+      numero: existingRow[10] || '',
+      complemento: existingRow[11] || '',
+      bairro: existingRow[12] || '',
+      cidade: existingRow[13] || '',
+      estado: existingRow[14] || '',
+      dataAdmissao: existingRow[15] || '',
+      statusUsuario: existingRow[16] || '',
+      permissoes: existingRow[17] || '',
+      senha: existingRow[18] || '',
+      salarioFixo: existingRow[19] || '',
+      comissao1: existingRow[20] || '',
+      comissao2: existingRow[21] || '',
+      comissao3: existingRow[22] || '',
+      comissao4: existingRow[23] || '',
+      bonus: existingRow[24] || '',
+      observacoes: existingRow[25] || '',
+      imagem: existingRow[26] || '',
+      dataCadastro: existingRow[27] || '',
+    };
+
+    const saveBase64Image = (base64String, userId) => {
+      console.log('saveBase64Image called');
+      // Extract image extension and base64 data
+      const matches = base64String.match(/^data:image\/([a-zA-Z0-9+]+);base64,(.+)$/);
+      if (!matches) {
+        console.error('Invalid base64 image string');
+        throw new Error('Invalid base64 image string');
+      }
+      const ext = matches[1];
+      const data = matches[2];
+      const buffer = Buffer.from(data, 'base64');
+      const filename = `${userId}-${Date.now()}.${ext}`;
+      const uploadDir = path.join(__dirname, '../src/user-perfil-images');
+      console.log('uploadDir:', uploadDir);
+      if (!fs.existsSync(uploadDir)) {
+        console.log('Creating upload directory');
+        fs.mkdirSync(uploadDir, { recursive: true });
+      }
+      const filepath = path.join(uploadDir, filename);
+      console.log('Saving image file to:', filepath);
+      try {
+        fs.writeFileSync(filepath, buffer);
+      } catch (err) {
+        console.error('Error writing image file:', err);
+        throw err;
+      }
+      return filename;
+    };
+
+    // If imagem is a base64 string, save the image file and replace with filename
+    if (updateData.imagem && updateData.imagem.startsWith('data:image')) {
+      try {
+        // Delete old image file if exists and different from new
+        if (existingData.imagem && existingData.imagem !== '') {
+          const oldImagePath = path.join(__dirname, '../src/user-perfil-images', existingData.imagem);
+          if (fs.existsSync(oldImagePath)) {
+            fs.unlinkSync(oldImagePath);
+            console.log('Deleted old image file:', oldImagePath);
+          }
+        }
+        updateData.imagem = saveBase64Image(updateData.imagem, usuarioId);
+      } catch (err) {
+        console.error('Error saving base64 image:', err);
+        return res.status(400).json({ success: false, message: 'Invalid image data' });
+      }
+    }
+
+    // Merge updateData into existingData, only overwrite fields provided
+    const mergedData = {
+      ...existingData,
+      ...updateData,
+    };
+
+    // Prepare updated row data array
+    const updatedRow = [
+      mergedData.id,
+      mergedData.nome,
+      mergedData.nomeUsuario,
+      mergedData.email,
+      mergedData.filial, // replaced telefone with filial
+      mergedData.cpf,
+      mergedData.celular,
+      mergedData.cargo,
+      mergedData.cep,
+      mergedData.logradouro,
+      mergedData.numero,
+      mergedData.complemento,
+      mergedData.bairro,
+      mergedData.cidade,
+      mergedData.estado,
+      mergedData.dataAdmissao,
+      mergedData.statusUsuario,
+      mergedData.permissoes,
+      mergedData.senha,
+      mergedData.salarioFixo,
+      mergedData.comissao1,
+      mergedData.comissao2,
+      mergedData.comissao3,
+      mergedData.comissao4,
+      mergedData.bonus,
+      mergedData.observacoes,
+      mergedData.imagem || '', // new image column
+      mergedData.dataCadastro,
+    ];
+
+    // Calculate the row number in the sheet (offset by 2 because header + 1-based index)
+    const rowNumber = usuarioIndex + 2;
+
+    // Update the row in the sheet
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: USUARIOS_SPREADSHEET_ID,
+      range: `${USUARIOS_SHEET}!A${rowNumber}:AB${rowNumber}`,
+      valueInputOption: 'USER_ENTERED',
+      resource: {
+        values: [updatedRow],
+      },
+    });
+
+    res.json({ success: true, message: 'Usuário atualizado com sucesso' });
+  } catch (error) {
+    console.error('Error updating usuario:', error);
+    console.error('Full error details:', {
+      message: error.message,
+      stack: error.stack,
+      response: error.response?.data,
+    });
+    res.status(500).json({
+      message: 'Erro ao atualizar usuário',
+      error: error.message,
+    });
+  }
+});
+
+// DELETE endpoint to delete usuario by ID
+app.delete('/api/usuarios/:id', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const usuarioId = req.params.id;
+
+    // Fetch all usuarios from the sheet
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: USUARIOS_SPREADSHEET_ID,
+      range: `${USUARIOS_SHEET}!A2:AA`,
+    });
+
+    const rows = response.data.values || [];
+
+    // Find index of usuario by ID
+    const usuarioIndex = rows.findIndex(row => row[0] === usuarioId);
+
+    if (usuarioIndex === -1) {
+      return res.status(404).json({ message: 'Usuário não encontrado' });
+    }
+
+    // Remove the usuario row from the array
+    rows.splice(usuarioIndex, 1);
+
+    // Clear the existing data range (except header)
+    await sheets.spreadsheets.values.clear({
+      spreadsheetId: USUARIOS_SPREADSHEET_ID,
+      range: `${USUARIOS_SHEET}!A2:AA`,
+    });
+
+    // Append the updated rows back to the sheet
+    if (rows.length > 0) {
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: USUARIOS_SPREADSHEET_ID,
+        range: `${USUARIOS_SHEET}!A2:AA`,
+        valueInputOption: 'USER_ENTERED',
+        resource: {
+          values: rows,
+        },
+      });
+    }
+
+    res.json({ success: true, message: 'Usuário apagado com sucesso' });
+  } catch (error) {
+    console.error('Error deleting usuario:', error);
+    res.status(500).json({
+      message: 'Erro ao apagar usuário',
+      error: error.message,
+    });
+  }
+});
+
+// POST endpoint to mark a notification as read for a user
+app.post('/api/usuarios/:id/notifications/:notificationId/read', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const usuarioId = req.params.id;
+    const notificationId = req.params.notificationId;
+
+    // Fetch all usuarios from the sheet including notifications column AC (index 28)
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: USUARIOS_SPREADSHEET_ID,
+      range: `${USUARIOS_SHEET}!A2:AC`,
+    });
+
+    const rows = response.data.values || [];
+
+    // Find index of usuario by ID
+    const usuarioIndex = rows.findIndex(row => row[0] === usuarioId);
+
+    if (usuarioIndex === -1) {
+      return res.status(404).json({ message: 'Usuário não encontrado' });
+    }
+
+    // Parse personal notifications JSON from column AC (index 28)
+    let personalNotifications = [];
+    try {
+      personalNotifications = JSON.parse(rows[usuarioIndex][28] || '[]');
+      if (!Array.isArray(personalNotifications)) {
+        personalNotifications = [];
+      }
+    } catch (e) {
+      personalNotifications = [];
+    }
+
+    // Find the notification by id and mark as read
+    let notificationFound = false;
+    personalNotifications = personalNotifications.map(notif => {
+      if (notif.id === notificationId) {
+        notificationFound = true;
+        return { ...notif, read: true };
+      }
+      return notif;
+    });
+
+    if (!notificationFound) {
+      return res.status(404).json({ message: 'Notificação não encontrada' });
+    }
+
+    // Update the notifications JSON string in the row
+    rows[usuarioIndex][28] = JSON.stringify(personalNotifications);
+
+    // Update the sheet for this user's notifications column
+    const rowNumber = usuarioIndex + 2; // offset for header and 1-based index
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: USUARIOS_SPREADSHEET_ID,
+      range: `${USUARIOS_SHEET}!AC${rowNumber}:AC${rowNumber}`,
+      valueInputOption: 'USER_ENTERED',
+      resource: {
+        values: [[rows[usuarioIndex][28]]],
+      },
+    });
+
+    res.json({ success: true, message: 'Notificação marcada como lida' });
+  } catch (error) {
+    console.error('Error marking notification as read:', error);
+    res.status(500).json({
+      message: 'Erro ao marcar notificação como lida',
+      error: error.message,
+    });
+  }
+});

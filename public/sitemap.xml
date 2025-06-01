@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <!-- Página Principal -->
+  <url>
+    <loc>https://venussolucoes.com/</loc>
+    <lastmod>2024-04-26</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+  </url>
+  
+  <!-- Páginas de Localidades -->
+  <url>
+    <loc>https://venussolucoes.com/goiania</loc>
+    <lastmod>2024-04-26</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.9</priority>
+  </url>
+  <url>
+    <loc>https://venussolucoes.com/anapolis</loc>
+    <lastmod>2024-04-26</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.9</priority>
+  </url>
+  <url>
+    <loc>https://venussolucoes.com/brasilia</loc>
+    <lastmod>2024-04-26</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.9</priority>
+  </url>
+  
+  <!-- Páginas de Produtos/Serviços -->
+  <url>
+    <loc>https://venussolucoes.com/telhas-termicas</loc>
+    <lastmod>2024-04-26</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>
+   <url>
+    <loc>https://venussolucoes.com/telhas-termoacusticas</loc>
+    <lastmod>2024-04-26</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>
+   <url>
+    <loc>https://venussolucoes.com/isotelhas</loc>
+    <lastmod>2024-04-26</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>
+   <url>
+    <loc>https://venussolucoes.com/telhas-semi-sanduiches</loc>
+    <lastmod>2024-04-26</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>
+   <url>
+    <loc>https://venussolucoes.com/telhas-termicas-meio-sanduiche</loc>
+    <lastmod>2024-04-26</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://venussolucoes.com/paineis-isotermicos</loc>
+    <lastmod>2024-04-26</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>
+   <url>
+    <loc>https://venussolucoes.com/fechamentos-arquitetonico</loc>
+    <lastmod>2024-04-26</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://venussolucoes.com/fechamentos-aco</loc>
+    <lastmod>2024-04-26</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://venussolucoes.com/galpoes-industriais</loc>
+    <lastmod>2024-04-26</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>
+</urlset>
