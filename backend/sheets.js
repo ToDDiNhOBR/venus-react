@@ -50,6 +50,9 @@ async function initializeSheets() {
     await sheets.spreadsheets.get({
       spreadsheetId: USUARIOS_SPREADSHEET_ID
     });
+    await sheets.spreadsheets.get({
+      spreadsheetId: PRODUTOS_SPREADSHEET_ID
+    });
 
     console.log('Successfully connected to Google Sheets API for all spreadsheets');
     return sheets;
