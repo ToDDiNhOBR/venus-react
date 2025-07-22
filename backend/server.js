@@ -2187,3 +2187,42 @@ app.post('/api/usuarios/:id/notifications/:notificationId/read', async (req, res
     });
   }
 });
+
+// GET endpoint to fetch clauses from Google Sheets
+app.get('/api/clausulas', async (req, res) => {
+  try {
+    if (!sheets) {
+      throw new Error('Google Sheets API not initialized');
+    }
+
+    const CLAUSULAS_SPREADSHEET_ID = '1ELUmks6qfxBI2Z8Ow4XK0RNzacIf0xKmaBIMDIBM2Wk';
+    const CLAUSULAS_SHEET = 'Clausulas';
+
+    console.log('Fetching clausulas from spreadsheet...');
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: CLAUSULAS_SPREADSHEET_ID,
+      range: `${CLAUSULAS_SHEET}!A2:B`, // Get data starting from row 2, columns A and B
+    });
+
+    const rows = response.data.values || [];
+    console.log('Raw data from sheet:', rows);
+
+    // Map rows to clause objects
+    // Column A = ID, Column B = Descrição
+    const clausulas = rows.map((row) => ({
+      id: row[0] || '', // Column A has the ID
+      texto: row[1] || '', // Column B has the description
+      ativa: true, // Default all clauses as active since there's no active column
+      categoria: ''
+    })).filter(clausula => clausula.texto.trim() !== ''); // Filter out empty clauses
+
+    console.log('Processed clausulas:', clausulas);
+    res.json({ clausulas });
+  } catch (error) {
+    console.error('Error fetching clausulas:', error);
+    res.status(500).json({
+      message: 'Erro ao buscar cláusulas',
+      error: error.message,
+    });
+  }
+});

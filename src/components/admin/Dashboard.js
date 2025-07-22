@@ -37,7 +37,7 @@ const Dashboard = () => {
             <div className="flex items-center">
               <div className="flex-shrink-0">
                 <Link to="/admin" className="text-white font-bold text-xl hover:text-blue-400 transition-colors">
-                  Venus Admin
+                  Termogoias
                 </Link>
               </div>
               <div className="hidden md:block">

@@ -3,10 +3,11 @@ const router = express.Router();
 
 const { getSheets, getNextId, PRODUTOS_SPREADSHEET_ID, PRODUTOS_SHEET } = require('./sheets');
 
-// GET all products
+// GET all products with search functionality
 router.get('/', async (req, res) => {
   try {
     const sheets = getSheets();
+    const { search } = req.query;
 
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: PRODUTOS_SPREADSHEET_ID,
@@ -15,7 +16,7 @@ router.get('/', async (req, res) => {
 
     const rows = response.data.values || [];
 
-    const products = rows.map(row => ({
+    let products = rows.map(row => ({
       id: row[0] || '',
       nomeProduto: row[1] || '',
       ncm: row[2] || '',
@@ -24,6 +25,15 @@ router.get('/', async (req, res) => {
       categoria: row[5] || '',
       descricao: row[6] || ''
     }));
+
+    // Filter products if search parameter is provided
+    if (search) {
+      const searchTerm = search.toLowerCase();
+      products = products.filter(product => 
+        product.id.toLowerCase().includes(searchTerm) ||
+        product.nomeProduto.toLowerCase().includes(searchTerm)
+      );
+    }
 
     res.json({ products });
   } catch (error) {

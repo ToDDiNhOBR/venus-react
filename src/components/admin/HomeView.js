@@ -18,7 +18,7 @@ const HomeView = () => {
           {/* Center content */}
           <div className="text-center text-white space-y-4">
             <h1 className="text-4xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-500">
-              Venus Admin
+              Grupo Vênus
             </h1>
             <p className="text-gray-400">Sistema de Gestão</p>
           </div>
